@@ -1,0 +1,90 @@
+{
+  "$id": "https://clinic-copilot/schemas/v1/soap-note.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SOAP Note v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "disclaimer", "subjective", "objective", "assessment", "plan"],
+  "properties": {
+    "schemaVersion": { "type": "string", "const": "1.0" },
+
+    "disclaimer": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Clinician-in-the-loop disclaimer text."
+    },
+
+    "subjective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chiefComplaint", "hpi"],
+      "properties": {
+        "chiefComplaint": { "$ref": "#/$defs/FieldValue" },
+        "hpi": { "$ref": "#/$defs/FieldValue" },
+        "pmh": { "$ref": "#/$defs/FieldValue" },
+        "medications": { "$ref": "#/$defs/FieldValue" },
+        "allergies": { "$ref": "#/$defs/FieldValue" },
+        "ros": { "$ref": "#/$defs/FieldValue" }
+      }
+    },
+
+    "objective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vitals", "physicalExam"],
+      "properties": {
+        "vitals": { "$ref": "#/$defs/FieldValue" },
+        "physicalExam": { "$ref": "#/$defs/FieldValue" },
+        "labsImagingMentioned": { "$ref": "#/$defs/FieldValue" }
+      }
+    },
+
+    "assessment": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/$defs/FieldValue" },
+      "description": "Assessment statements extracted from transcript only."
+    },
+
+    "plan": {
+      "type": "array",
+      "minItems": 0,
+      "items": { "$ref": "#/$defs/FieldValue" },
+      "description": "Plan items extracted from transcript only."
+    }
+  },
+
+  "$defs": {
+    "EvidenceCitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quote", "speaker", "startMs", "endMs"],
+      "properties": {
+        "quote": { "type": "string", "minLength": 1 },
+        "speaker": { "type": "string", "enum": ["Doctor", "Patient", "Unknown"] },
+        "startMs": { "type": "integer", "minimum": 0 },
+        "endMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "FieldValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "verificationNeeded", "evidence"],
+      "properties": {
+        "value": {
+          "type": ["string", "number", "boolean", "null"],
+          "description": "Null when not present in transcript."
+        },
+        "verificationNeeded": {
+          "type": "boolean",
+          "description": "True when value is missing or ambiguous."
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EvidenceCitation" }
+        }
+      }
+    }
+  }
+}

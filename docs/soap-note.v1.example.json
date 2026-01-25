@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "1.0",
+  "disclaimer": "Draft generated from conversation transcript. Clinician must review and approve. Not a substitute for medical judgment.",
+  "subjective": {
+    "chiefComplaint": {
+      "value": "Chest tightness",
+      "verificationNeeded": false,
+      "evidence": [
+        { "quote": "I've had chest tightness since yesterday.", "speaker": "Patient", "startMs": 0, "endMs": 3800 }
+      ]
+    },
+    "hpi": {
+      "value": "Symptoms began yesterday; denies dizziness; shortness of breath unclear.",
+      "verificationNeeded": true,
+      "evidence": [
+        { "quote": "since yesterday", "speaker": "Patient", "startMs": 1500, "endMs": 2200 }
+      ]
+    }
+  },
+  "objective": {
+    "vitals": {
+      "value": null,
+      "verificationNeeded": true,
+      "evidence": []
+    },
+    "physicalExam": {
+      "value": null,
+      "verificationNeeded": true,
+      "evidence": []
+    },
+    "labsImagingMentioned": {
+      "value": "EKG discussed",
+      "verificationNeeded": true,
+      "evidence": [
+        { "quote": "We may do an EKG today.", "speaker": "Doctor", "startMs": 8000, "endMs": 9500 }
+      ]
+    }
+  },
+  "assessment": [
+    {
+      "value": "Chest tightness requiring clinician evaluation",
+      "verificationNeeded": true,
+      "evidence": [
+        { "quote": "chest tightness", "speaker": "Patient", "startMs": 0, "endMs": 3800 }
+      ]
+    }
+  ],
+  "plan": [
+    {
+      "value": "Clinician to review next steps; consider EKG if clinically appropriate",
+      "verificationNeeded": true,
+      "evidence": [
+        { "quote": "We may do an EKG today.", "speaker": "Doctor", "startMs": 8000, "endMs": 9500 }
+      ]
+    }
+  ]
+}
