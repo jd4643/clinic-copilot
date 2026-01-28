@@ -1,3 +1,24 @@
 spring:
   application:
     name: clinic-copilot-api
+  servlet:
+    multipart:
+      max-file-size: 25MB
+      max-request-size: 25MB
+
+ai:
+  runtime:
+    baseUrl: http://35.196.21.94:8000
+    apiKey: dev_mml_bk1_Xt7Kp9Qm2Ws4Yn6Vb8Hj0Lc3Rf5Tg7Ui9Oa1Ed
+
+app:
+  upload:
+    maxBytes: 26214400 # 25MB
+
+api:
+  key: dev_mml_bk1_Xt7Kp9Qm2Ws4Yn6Vb8Hj0Lc3Rf5Tg7Ui9Oa1Ed
+
+server:
+  tomcat:
+    max-swallow-size: 25MB
+    port: 8080
