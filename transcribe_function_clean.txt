@@ -1,0 +1,44 @@
+@app.post("/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Transcribe audio using MedASR pipeline"""
+    try:
+        logger.info(f"Transcription request: {audio.filename}")
+        
+        file_ext = os.path.splitext(audio.filename)[1].lower()
+        allowed = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm']
+        
+        if file_ext not in allowed:
+            raise HTTPException(400, f"Unsupported format '{file_ext}'. Allowed: {allowed}")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+        
+        try:
+            pipe, _ = model_manager.get_medasr()
+            logger.info("Transcribing with MedASR pipeline...")
+            
+            result = pipe(tmp_path, chunk_length_s=20, stride_length_s=2)
+            text = result['text']
+            
+            import librosa
+            duration = librosa.get_duration(path=tmp_path)
+            
+            logger.info(f"Done: {len(text)} chars")
+            
+            return TranscriptionResponse(
+                text=text,
+                language="en",
+                model="google/medasr",
+                duration_seconds=duration
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        if "out of memory" in str(e).lower():
+            model_manager.unload_all()
+            raise HTTPException(503, "GPU OOM. Retry.")
+        raise HTTPException(500, f"Failed: {str(e)}")
