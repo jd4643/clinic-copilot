@@ -39,26 +39,58 @@ public class AsrClient {
                 .contentType(MediaType.MULTIPART_FORM_DATA)
                 .body(BodyInserters.fromMultipartData(builder.build()))
                 .retrieve()
-                .bodyToMono(AsrRuntimeResponse.class)
-                .map(r -> new TranscriptionResponse.AsrResult(
-                        r.transcript(),        // Changed from r.transcript()
-                        r.segments()     // Will be null since MedASR doesn't return segments
+                .bodyToMono(FastApiResponse.class)  // Parse full response
+                .map(response -> new TranscriptionResponse.AsrResult(
+                        response.asr().text(),      // Get text from nested asr object
+                        response.asr().segments()     // Will be null since MedASR doesn't return segments
                 ));
     }
 
     // This matches what Python returns.
+/*
     public record AsrRuntimeResponse(String transcript, java.util.List<TranscriptionResponse.Segment> segments) {}
+*/
 
 
 
 
-      /*  public record AsrRuntimeResponse(
+     /*   public record AsrRuntimeResponse(
                 String text,                    // Changed from "transcript" to "text"
                 String language,                // Added
                 String model,                   // Added
                 @JsonProperty("duration_seconds") double durationSeconds,  // Added
                 List<TranscriptionResponse.Segment> segments  // Keep this (even though not in response)
         ) {}*/
+
+
+    // This matches the COMPLETE FastAPI response structure
+    public record FastApiResponse(
+            String requestId,
+            String sessionId,
+            String status,
+            AudioInfo audio,
+            AsrData asr,           // This is the nested object!
+            List<String> warnings,
+            ErrorInfo error
+    ) {}
+
+    public record AudioInfo(
+            String originalFileName,
+            String contentType,
+            int sizeBytes,
+            int durationMs
+    ) {}
+
+    // This matches the "asr" field in FastAPI response
+    public record AsrData(
+            String text,           // FastAPI uses "text" not "transcript"
+            List<TranscriptionResponse.Segment> segments
+    ) {}
+
+    public record ErrorInfo(
+            String code,
+            String message
+    ) {}
 
 
 }
