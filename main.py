@@ -15,6 +15,7 @@ from datetime import datetime
 # Add near the top with other imports
 from auth import verify_api_key, get_key_info, API_KEY_HEADER_NAME
 from fastapi import Depends
+from fastapi import Form
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -45,11 +46,24 @@ app = FastAPI(
 # REQUEST/RESPONSE MODELS
 # ============================================================================
 
+class AudioInfo(BaseModel):
+    originalFileName: str
+    contentType: str
+    sizeBytes: int
+    durationMs: int
+
+class ASRResult(BaseModel):
+    transcript: Optional[str] = None
+    segments: Optional[list] = None
+
 class TranscriptionResponse(BaseModel):
-    text: str
-    language: str = "en"
-    model: str = "medical-asr"
-    duration_seconds: Optional[float] = None
+    requestId: str
+    sessionId: Optional[str] = None
+    status: str
+    audio: AudioInfo
+    asr: ASRResult
+    warnings: list = []
+    error: Optional[dict] = None
 
 class MedicalQueryRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000, description="Medical question or text to analyze")
@@ -135,8 +149,12 @@ async def health_check():
 async def transcribe_audio(
     background_tasks: BackgroundTasks,
     audio: UploadFile = File(..., description="Audio file (wav, mp3, m4a, flac)"),
+    sessionId: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key)
 ):
+
+
+
     """
     Transcribe medical audio to text using MedASR
     
@@ -145,21 +163,98 @@ async def transcribe_audio(
     
     **Note**: Optimized for medical speech (doctor-patient conversations, dictations)
     """
-    logger.info(f"Transcription request: {audio.filename}")
+    import uuid
     
-    # Validate file type
+    # Generate correlation ID for tracking
+    correlation_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{correlation_id}] Transcription request: {audio.filename}")
+    
+    # Validate file extension
     allowed_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm']
     file_ext = Path(audio.filename).suffix.lower()
     
     if file_ext not in allowed_extensions:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported audio format '{file_ext}'. Allowed: {allowed_extensions}"
+        logger.warning(f"[{correlation_id}] Unsupported format: {file_ext}")
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
         )
+
+        
+        
+     
+    # Read file content
+    content = await audio.read()
+    
+    # Check for empty file
+    if len(content) == 0:
+        logger.warning(f"[{correlation_id}] Empty file uploaded: {audio.filename}")
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
+        )
+       
+    
+    # Check minimum file size (audio files should be at least 1KB)
+    if len(content) < 1024:
+        logger.warning(f"[{correlation_id}] File too small: {len(content)} bytes")
+        
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
+        )
+       
     
     # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-        content = await audio.read()
         tmp.write(content)
         tmp_path = tmp.name
     
@@ -167,7 +262,7 @@ async def transcribe_audio(
         # Get MedASR pipeline
         pipe, _ = model_manager.get_medasr()
         
-        logger.info("Transcribing with MedASR pipeline...")
+        logger.info(f"[{correlation_id}] Transcribing with MedASR pipeline...")
         
         # Use pipeline directly - it handles all audio processing
         result = pipe(
@@ -178,33 +273,72 @@ async def transcribe_audio(
         
         text = result['text']
         
-        # Calculate duration
-        duration = librosa.get_duration(path=tmp_path)
+        # Validate transcription result
+        if text is None or len(text.strip()) == 0:
+            logger.warning(f"[{correlation_id}] Empty transcription result")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "Transcription failed",
+                    "message": "Could not extract any text from the audio. The file may be silent, corrupted, or contain no speech.",
+                    "filename": audio.filename,
+                    "correlation_id": correlation_id
+                }
+            )
         
-        logger.info(f"Transcription completed: {len(text)} chars")
+        # Calculate duration
+        try:
+            duration = librosa.get_duration(path=tmp_path)
+        except Exception as dur_err:
+            logger.warning(f"[{correlation_id}] Could not get duration: {dur_err}")
+            duration = 0.0
+        
+        logger.info(f"[{correlation_id}] Transcription completed: {len(text)} chars")
         
         # Schedule cleanup
         background_tasks.add_task(model_manager.cleanup_idle_models)
         
+        
         return TranscriptionResponse(
-            text=text.strip(),
-            language="en",
-            model="google/medasr",
-            duration_seconds=round(duration, 2)
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="SUCCESS",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=len(content),
+                durationMs=int(duration * 1000)
+            ),
+            asr=ASRResult(
+                transcript=text.strip(),
+                segments=None
+           ),
+            warnings=[],
+            error=None
         )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
         
     except Exception as e:
-        logger.error(f"Transcription error: {str(e)}", exc_info=True)
+        logger.error(f"[{correlation_id}] Transcription error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Transcription failed: {str(e)}"
+            detail={
+                "error": "Transcription failed",
+                "message": "An internal error occurred while processing the audio",
+                "details": str(e),
+                "correlation_id": correlation_id
+            }
         )
     
     finally:
         # Clean up temp file
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception as cleanup_err:
+            logger.warning(f"[{correlation_id}] Failed to cleanup temp file: {cleanup_err}")
 # ============================================================================
 # MEDICAL LLM ENDPOINT (Text → Medical Response)
 # ============================================================================
