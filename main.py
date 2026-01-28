@@ -53,8 +53,9 @@ class AudioInfo(BaseModel):
     durationMs: int
 
 class ASRResult(BaseModel):
-    transcript: Optional[str] = None
+    text: Optional[str] = None
     segments: Optional[list] = None
+
 
 class TranscriptionResponse(BaseModel):
     requestId: str
@@ -309,8 +310,10 @@ async def transcribe_audio(
                 sizeBytes=len(content),
                 durationMs=int(duration * 1000)
             ),
+
+           
             asr=ASRResult(
-                transcript=text.strip(),
+                text=text.strip(),
                 segments=None
            ),
             warnings=[],
