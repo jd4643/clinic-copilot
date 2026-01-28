@@ -1,0 +1,6 @@
+ai:
+  runtime:
+    baseUrl: http://localhost:8080/mock
+app:
+  upload:
+    maxBytes: 26214400 # 25MB
