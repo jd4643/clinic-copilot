@@ -1,0 +1,573 @@
+"""
+Medical ML API - FastAPI application
+Provides MedASR (Speech-to-Text) and MedGemma (Medical LLM) endpoints
+"""
+import os
+import logging
+import tempfile
+
+from pathlib import Path
+from typing import Optional
+import torch
+import librosa
+import numpy as np
+from datetime import datetime
+# Add near the top with other imports
+from auth import verify_api_key, get_key_info, API_KEY_HEADER_NAME
+from fastapi import Depends
+from fastapi import Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+import uvicorn
+
+from model_manager import model_manager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.expanduser('~/ml-platform/logs/api/api.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Medical ML API",
+    description="MedGemma LLM + MedASR for medical applications",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+class AudioInfo(BaseModel):
+    originalFileName: str
+    contentType: str
+    sizeBytes: int
+    durationMs: int
+
+class ASRResult(BaseModel):
+    text: Optional[str] = None
+    segments: Optional[list] = None
+
+
+class TranscriptionResponse(BaseModel):
+    requestId: str
+    sessionId: Optional[str] = None
+    status: str
+    audio: AudioInfo
+    asr: ASRResult
+    warnings: list = []
+    error: Optional[dict] = None
+
+class MedicalQueryRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2000, description="Medical question or text to analyze")
+    max_tokens: int = Field(default=256, ge=1, le=512, description="Maximum tokens to generate")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    
+    @field_validator('text')
+    @classmethod
+    def sanitize_text(cls, v):
+        """Prevent prompt injection attacks"""
+        v = v.strip()
+        forbidden = [
+            'ignore previous', 'ignore above', 'ignore instructions',
+            'system:', 'admin:', '<|im_start|>', 'override'
+        ]
+        v_lower = v.lower()
+        for pattern in forbidden:
+            if pattern in v_lower:
+                raise ValueError(f"Input contains forbidden pattern: {pattern}")
+        return v
+
+class MedicalQueryResponse(BaseModel):
+    response: str
+    disclaimer: str
+    model: str = "medgemma-1.5-4b"
+    tokens_generated: int
+    
+class AudioToMedicalResponse(BaseModel):
+    transcription: str
+    medical_response: str
+    disclaimer: str
+    pipeline: str = "MedASR → MedGemma"
+
+# ============================================================================
+# HEALTH & STATUS ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "service": "Medical ML API",
+        "version": "1.0.0",
+        "models": {
+            "llm": "MedGemma 1.5 4B",
+            "asr": "MedASR"
+        },
+        "endpoints": {
+            "health": "/health",
+            "transcribe": "/transcribe",
+            "medical_query": "/medical-query",
+            "pipeline": "/audio-to-medical",
+            "docs": "/docs"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint with GPU status"""
+    gpu_available = torch.cuda.is_available()
+    gpu_memory = None
+    
+    if gpu_available:
+        gpu_memory = {
+            "allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
+            "reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
+            "total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
+            "free_gb": round((torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1e9, 2)
+        }
+    
+    return {
+        "status": "healthy",
+        "gpu_available": gpu_available,
+        "gpu_memory": gpu_memory,
+        "loaded_models": list(model_manager.models.keys())
+    }
+
+# ============================================================================
+# ASR ENDPOINT (Audio → Text)
+# ============================================================================
+
+@app.post("/transcribe", response_model=TranscriptionResponse)
+async def transcribe_audio(
+    background_tasks: BackgroundTasks,
+    audio: UploadFile = File(..., description="Audio file (wav, mp3, m4a, flac)"),
+    sessionId: Optional[str] = Form(None),
+    api_key: str = Depends(verify_api_key)
+):
+
+
+
+    """
+    Transcribe medical audio to text using MedASR
+    
+    **Accepts**: audio files in common formats (wav, mp3, m4a, flac, ogg)
+    **Returns**: Transcribed text
+    
+    **Note**: Optimized for medical speech (doctor-patient conversations, dictations)
+    """
+    import uuid
+    
+    # Generate correlation ID for tracking
+    correlation_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{correlation_id}] Transcription request: {audio.filename}")
+    
+    # Validate file extension
+    allowed_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.webm']
+    file_ext = Path(audio.filename).suffix.lower()
+    
+    if file_ext not in allowed_extensions:
+        logger.warning(f"[{correlation_id}] Unsupported format: {file_ext}")
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
+        )
+
+        
+        
+     
+    # Read file content
+    content = await audio.read()
+    
+    # Check for empty file
+    if len(content) == 0:
+        logger.warning(f"[{correlation_id}] Empty file uploaded: {audio.filename}")
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
+        )
+       
+    
+    # Check minimum file size (audio files should be at least 1KB)
+    if len(content) < 1024:
+        logger.warning(f"[{correlation_id}] File too small: {len(content)} bytes")
+        
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="FAILED",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=0,
+                durationMs=0
+            ),
+            asr=ASRResult(
+                transcript=None,
+                segments=None
+            ),
+            warnings=[],
+            error={
+                "code": "EMPTY_FILE",
+                "message": "The uploaded audio file is empty"
+            }
+        )
+       
+    
+    # Save uploaded file temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    
+    try:
+        # Get MedASR pipeline
+        pipe, _ = model_manager.get_medasr()
+        
+        logger.info(f"[{correlation_id}] Transcribing with MedASR pipeline...")
+        
+        # Use pipeline directly - it handles all audio processing
+        result = pipe(
+            tmp_path,
+            chunk_length_s=20,
+            stride_length_s=2
+        )
+        
+        text = result['text']
+        
+        # Validate transcription result
+        if text is None or len(text.strip()) == 0:
+            logger.warning(f"[{correlation_id}] Empty transcription result")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "Transcription failed",
+                    "message": "Could not extract any text from the audio. The file may be silent, corrupted, or contain no speech.",
+                    "filename": audio.filename,
+                    "correlation_id": correlation_id
+                }
+            )
+        
+        # Calculate duration
+        try:
+            duration = librosa.get_duration(path=tmp_path)
+        except Exception as dur_err:
+            logger.warning(f"[{correlation_id}] Could not get duration: {dur_err}")
+            duration = 0.0
+        
+        logger.info(f"[{correlation_id}] Transcription completed: {len(text)} chars")
+        
+        # Schedule cleanup
+        background_tasks.add_task(model_manager.cleanup_idle_models)
+        
+        
+        return TranscriptionResponse(
+            requestId=correlation_id,
+            sessionId=sessionId,
+            status="SUCCESS",
+            audio=AudioInfo(
+                originalFileName=audio.filename,
+                contentType=audio.content_type or "audio/unknown",
+                sizeBytes=len(content),
+                durationMs=int(duration * 1000)
+            ),
+
+           
+            asr=ASRResult(
+                text=text.strip(),
+                segments=None
+           ),
+            warnings=[],
+            error=None
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+        
+    except Exception as e:
+        logger.error(f"[{correlation_id}] Transcription error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Transcription failed",
+                "message": "An internal error occurred while processing the audio",
+                "details": str(e),
+                "correlation_id": correlation_id
+            }
+        )
+    
+    finally:
+        # Clean up temp file
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception as cleanup_err:
+            logger.warning(f"[{correlation_id}] Failed to cleanup temp file: {cleanup_err}")
+# ============================================================================
+# MEDICAL LLM ENDPOINT (Text → Medical Response)
+# ============================================================================
+
+@app.post("/medical-query", response_model=MedicalQueryResponse)
+async def medical_query(
+    request: MedicalQueryRequest,
+    background_tasks: BackgroundTasks,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Process medical query using MedGemma LLM
+    
+    **DISCLAIMER**: This is for educational/informational purposes only.
+    NOT for medical diagnosis or treatment decisions.
+    
+    **Use cases**:
+    - Explain medical concepts
+    - Provide health information
+    - Summarize medical text
+    - Answer medical questions
+    
+    **Does NOT**:
+    - Diagnose conditions
+    - Prescribe medications
+    - Provide treatment plans
+    - Replace healthcare professionals
+    """
+    logger.info(f"Medical query: {request.text[:100]}...")
+    
+    try:
+        # Get MedGemma model
+        model, tokenizer = model_manager.get_medgemma()
+        
+        # Create message in chat format for instruction-tuned model
+        user_message = f"""Please provide educational information only. Do not diagnose or prescribe.Always remind to consult healthcare professionals.
+
+        Question: {request.text}"""
+
+        messages = [
+            {'role': 'user', 'content': user_message}
+        ]
+        
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        # Tokenize
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        
+        # Generate
+        logger.info("Generating medical response...")
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=request.max_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        # Decode
+        input_length = inputs['input_ids'].shape[1]
+        generated_tokens = outputs[0][input_length:]
+        
+        # Extract only the generated part (remove prompt)
+        response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        
+        tokens_generated = len(outputs[0]) - len(inputs['input_ids'][0])
+        
+        logger.info(f"Generated {tokens_generated} tokens")
+        
+        # Schedule cleanup
+        background_tasks.add_task(model_manager.cleanup_idle_models)
+        
+        return MedicalQueryResponse(
+            response=response_text,
+            disclaimer="⚠️ This is for educational purposes only. Always consult a qualified healthcare professional for medical advice, diagnosis, or treatment.",
+            tokens_generated=tokens_generated
+        )
+        
+    except torch.cuda.OutOfMemoryError:
+        logger.error("GPU Out of Memory!")
+        model_manager.unload_all()
+        raise HTTPException(
+            status_code=503,
+            detail="GPU out of memory. Models have been unloaded. Please try again."
+        )
+    except Exception as e:
+        logger.error(f"Medical query error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query processing failed: {str(e)}"
+        )
+
+# ============================================================================
+# COMBINED PIPELINE (Audio → Transcription → Medical Response)
+# ============================================================================
+
+@app.post("/audio-to-medical", response_model=AudioToMedicalResponse)
+async def audio_to_medical(
+    background_tasks: BackgroundTasks,
+    audio: UploadFile = File(..., description="Medical audio recording"),
+    max_tokens: int = Form(default=256, ge=1, le=512),
+    temperature: float = Form(default=0.7, ge=0.0, le=2.0),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Complete medical AI pipeline: Audio → Transcription → Medical Analysis
+    
+    **Pipeline**:
+    1. MedASR transcribes the audio to text
+    2. MedGemma analyzes the transcribed text
+    3. Returns both transcription and medical response
+    
+    **Example use cases**:
+    - Patient question recording → Medical explanation
+    - Doctor's dictation → Structured analysis
+    - Symptom description → Educational information
+    
+    **DISCLAIMER**: For educational purposes only. Not for diagnosis or treatment.
+    """
+    logger.info(f"Audio-to-medical pipeline: {audio.filename}")
+    
+    try:
+        # Step 1: Transcribe audio
+        logger.info("Pipeline Step 1: Transcribing audio...")
+        transcribe_response = await transcribe_audio(background_tasks, audio)
+        
+        # Step 2: Process with MedGemma
+        logger.info("Pipeline Step 2: Processing with MedGemma...")
+        medical_request = MedicalQueryRequest(
+            text=transcribe_response.text,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+        medical_response = await medical_query(medical_request, background_tasks)
+        
+        logger.info("Pipeline completed successfully")
+        
+        return AudioToMedicalResponse(
+            transcription=transcribe_response.text,
+            medical_response=medical_response.response,
+            disclaimer=medical_response.disclaimer
+        )
+        
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
+    except Exception as e:
+        logger.error(f"Pipeline error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Pipeline failed: {str(e)}"
+        )
+
+# ============================================================================
+# ADMIN ENDPOINTS
+# ============================================================================
+
+@app.post("/admin/cleanup")
+async def force_cleanup(api_key: str = Depends(verify_api_key)):
+    """
+    Force unload all models from GPU memory
+    
+    **Use when**:
+    - GPU running out of memory
+    - Need to free resources
+    - Troubleshooting issues
+    """
+    logger.info("Admin: Force cleanup requested")
+    model_manager.unload_all()
+    
+    return {
+        "status": "success",
+        "message": "All models unloaded from GPU",
+        "gpu_memory_allocated": round(torch.cuda.memory_allocated(0) / 1e9, 2)
+    }
+
+@app.get("/admin/models")
+async def list_models(api_key: str = Depends(verify_api_key)):
+    """List currently loaded models and their stats"""
+    models_info = {}
+    
+    for name, state in model_manager.models.items():
+        models_info[name] = {
+            "last_used": str(state.last_used),
+            "load_time_seconds": round(state.load_time, 2),
+            "age_minutes": round((datetime.now() - state.last_used).total_seconds() / 60, 2)
+        }
+    
+    return {
+        "loaded_models": models_info,
+        "gpu_memory_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2)
+    }
+
+# ============================================================================
+# STARTUP/SHUTDOWN EVENTS
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Run on API startup"""
+    logger.info("="*60)
+    logger.info("Medical ML API Starting...")
+    logger.info("="*60)
+    logger.info(f"GPU Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    logger.info("API Documentation: http://0.0.0.0:8000/docs")
+    logger.info("="*60)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Run on API shutdown"""
+    logger.info("Shutting down Medical ML API...")
+    model_manager.unload_all()
+    logger.info("All models unloaded. Goodbye!")
+
+# ============================================================================
+# MAIN (for direct execution)
+# ============================================================================
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )

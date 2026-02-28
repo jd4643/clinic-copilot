@@ -1,0 +1,144 @@
+"""
+Model lifecycle management with lazy loading and TTL cache
+"""
+import gc
+import time
+import torch
+from typing import Optional, Dict, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ModelState:
+    model: any
+    tokenizer: Optional[any]
+    processor: Optional[any]
+    last_used: datetime
+    load_time: float
+
+class ModelManager:
+    """
+    Manages model lifecycle:
+    - Lazy loading (only load when needed)
+    - TTL-based unloading (free GPU after idle time)
+    - Prevents OOM by managing GPU memory
+    """
+    
+    def __init__(self, ttl_minutes: int = 10):
+        self.models: Dict[str, ModelState] = {}
+        self.ttl = timedelta(minutes=ttl_minutes)
+        self.cache_dir = os.path.expanduser("~/ml-platform/cache")
+        
+    def get_medgemma(self) -> Tuple[any, any]:
+        """Get or load MedGemma model"""
+        if "medgemma" in self.models:
+            self.models["medgemma"].last_used = datetime.now()
+            return self.models["medgemma"].model, self.models["medgemma"].tokenizer
+        
+        return self._load_medgemma()
+    
+    def get_medasr(self) -> Tuple[any, any]:
+        """Get or load MedASR model"""
+        if "medasr" in self.models:
+            self.models["medasr"].last_used = datetime.now()
+            return self.models["medasr"].model, self.models["medasr"].processor
+        
+        return self._load_medasr()
+    
+    def _load_medgemma(self):
+        """Load MedGemma into GPU memory"""
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        logger.info("Loading MedGemma...")
+        start = time.time()
+        
+        model_name = "google/medgemma-1.5-4b-it"
+        cache_dir = f"{self.cache_dir}/medgemma"
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=True
+        )
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        
+        load_time = time.time() - start
+        logger.info(f"MedGemma loaded in {load_time:.2f}s")
+        
+        self.models["medgemma"] = ModelState(
+            model=model,
+            tokenizer=tokenizer,
+            processor=None,
+            last_used=datetime.now(),
+            load_time=load_time
+        )
+        
+        return model, tokenizer
+    
+    def _load_medasr(self):
+        """Load MedASR into GPU memory"""
+        # TODO: Implement proper MedASR loading once we understand its API
+        # For now, we'll use Whisper as a placeholder
+        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+        
+        logger.info("Loading Medical ASR (Whisper)...")
+        start = time.time()
+        
+        model_name = "openai/whisper-medium"
+        
+        processor = WhisperProcessor.from_pretrained(model_name)
+        
+        model = WhisperForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        
+        load_time = time.time() - start
+        logger.info(f"Medical ASR loaded in {load_time:.2f}s")
+        
+        self.models["medasr"] = ModelState(
+            model=model,
+            tokenizer=None,
+            processor=processor,
+            last_used=datetime.now(),
+            load_time=load_time
+        )
+        
+        return model, processor
+    
+    def cleanup_idle_models(self):
+        """Unload models that haven't been used recently"""
+        now = datetime.now()
+        to_remove = []
+        
+        for name, state in self.models.items():
+            if now - state.last_used > self.ttl:
+                to_remove.append(name)
+        
+        for name in to_remove:
+            logger.info(f"Unloading idle model: {name}")
+            del self.models[name]
+            gc.collect()
+            torch.cuda.empty_cache()
+    
+    def unload_all(self):
+        """Force unload all models"""
+        self.models.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("All models unloaded")
+
+# Global instance
+model_manager = ModelManager(ttl_minutes=10)
